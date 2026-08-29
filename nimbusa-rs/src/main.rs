@@ -10,6 +10,7 @@ mod ui_shield;
 
 use nimbusa::config::Config;
 use nimbusa::shield::engine::Command as SC;
+use nimbusa::shield::health::State as HState;
 use nimbusa::shield::simulate::Scenario;
 use nimbusa::shield::Shield;
 use nimbusa::system::*;
@@ -1452,62 +1453,69 @@ Docker/Traefik metadata is attached when those are present."
         );
         return;
     }
+    // Cross-reference the real health subsystem (no new probes): a domain the
+    // engine already confirmed healthy shows UP; a failed one DOWN; everything
+    // else honestly reports the socket state, LISTEN.
+    let health: std::collections::HashMap<String, HState> = app
+        .shield
+        .as_ref()
+        .map(|s| s.read())
+        .map(|s| {
+            s.health
+                .checks
+                .iter()
+                .map(|c| (c.name.clone(), c.state))
+                .collect()
+        })
+        .unwrap_or_default();
     let rows: Vec<Row> = app
         .inventory
         .iter()
         .map(|s| {
             let domain = if s.domain.is_empty() {
-                Span::styled("(no domain)", Style::default().fg(Color::DarkGray))
+                Span::styled("—", Style::default().fg(Color::DarkGray))
             } else {
                 Span::styled(s.domain.clone(), Style::default().fg(Color::Cyan))
-            };
-            let service = if !s.container.is_empty() {
-                s.container.clone()
-            } else if !s.process.is_empty() {
-                s.process.clone()
-            } else {
-                "—".into()
             };
             let proto = if s.app_proto.is_empty() {
                 s.proto.clone()
             } else {
                 s.app_proto.clone()
             };
-            let scope = s.scope();
-            let scope_col = if scope == "PUBLIC" {
-                Color::Yellow
-            } else {
-                Color::DarkGray
-            };
-            let src = match s.source.as_str() {
-                "traefik" => Span::styled("TRAEFIK", Style::default().fg(Color::Magenta)),
-                "docker" => Span::styled("DOCKER", Style::default().fg(Color::Blue)),
-                _ => Span::styled("SOCKET", Style::default().fg(Color::Gray)),
+            // STATUS: only UP/DOWN when health actually decided it, else LISTEN.
+            let (status, scol) = match health.get(&s.domain) {
+                Some(HState::Healthy) => ("UP", Color::Green),
+                Some(HState::Degraded) => ("DEGRADED", Color::Yellow),
+                Some(HState::Unavailable) => ("DOWN", Color::Red),
+                _ => (s.status(), Color::Gray),
             };
             Row::new(vec![
                 Cell::from(domain),
-                Cell::from(service),
+                Cell::from(s.display_name()),
                 Cell::from(s.bind.clone()),
                 Cell::from(format!("{}", s.port)),
                 Cell::from(proto),
-                Cell::from(Span::styled(scope, Style::default().fg(scope_col))),
-                Cell::from(src),
+                Cell::from(Span::styled(status, Style::default().fg(scol))),
+                Cell::from(Span::styled(
+                    s.source.clone(),
+                    Style::default().fg(Color::Gray),
+                )),
             ])
         })
         .collect();
     let (t, mut st) = table_widget(
         vec![
-            "DOMAIN", "SERVICE", "ADDRESS", "PORT", "PROTO", "SCOPE", "SOURCE",
+            "DOMAIN", "SERVICE", "ADDRESS", "PORT", "PROTO", "STATUS", "SOURCE",
         ],
         rows,
         vec![
-            Constraint::Min(18),
-            Constraint::Length(20),
+            Constraint::Min(16),
+            Constraint::Length(18),
             Constraint::Length(16),
             Constraint::Length(6),
-            Constraint::Length(7),
-            Constraint::Length(7),
-            Constraint::Length(8),
+            Constraint::Length(6),
+            Constraint::Length(9),
+            Constraint::Length(22),
         ],
         app.sel[T_DOMAINS],
         format!(" Domains & Services ({}) ", app.inventory.len()),

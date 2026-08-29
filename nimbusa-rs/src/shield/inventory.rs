@@ -12,7 +12,7 @@
 //!
 //! Nothing here is on the shield hot path: the base UI gathers it on the same
 //! slow cadence it already uses for docker, and the whole pass is bounded.
-use crate::util::have;
+use crate::util::{have, is_private};
 use std::collections::HashMap;
 
 /// One discovered service. Every field is real or empty — never a placeholder.
@@ -30,16 +30,53 @@ pub struct Service {
     pub container: String,
     pub image: String,
     pub domain: String,
-    /// Where this row was discovered: "socket" | "docker" | "traefik".
+    /// Accumulated evidence of where this row was discovered, e.g. "socket",
+    /// "socket+docker", "socket+docker+traefik".
     pub source: String,
 }
 
 impl Service {
-    /// Exposure class for the UI: is this reachable from outside the box?
+    /// Exposure class of the bind address. `0.0.0.0`/`::` bind to every
+    /// interface (ALL); loopback is local-only; RFC1918/ULA is PRIVATE; the
+    /// rest is a routable PUBLIC address. No address is fabricated.
     pub fn scope(&self) -> &'static str {
         match self.bind.as_str() {
-            "127.0.0.1" | "::1" => "LOCAL",
+            "0.0.0.0" | "::" => "ALL",
+            "127.0.0.1" | "::1" => "LOOPBACK",
+            b if is_private(b) => "PRIVATE",
             _ => "PUBLIC",
+        }
+    }
+
+    /// Native discovery only ever proves the socket is *listening*. HTTP "UP"
+    /// is decided by the health subsystem, never inferred here.
+    pub fn status(&self) -> &'static str {
+        "LISTEN"
+    }
+
+    /// Deterministic service name from real data, in priority order:
+    /// docker container, then process name, then a `listener:<port>` fallback
+    /// that is explicit about the application name being unresolved.
+    pub fn display_name(&self) -> String {
+        if !self.container.is_empty() {
+            self.container.clone()
+        } else if !self.process.is_empty() {
+            self.process.clone()
+        } else {
+            format!("listener:{}", self.port)
+        }
+    }
+
+    /// Record one more discovery source without duplicating it.
+    fn add_source(&mut self, s: &str) {
+        if self.source.split('+').any(|p| p == s) {
+            return;
+        }
+        if self.source.is_empty() {
+            self.source = s.to_string();
+        } else {
+            self.source.push('+');
+            self.source.push_str(s);
         }
     }
 }
@@ -203,9 +240,7 @@ pub fn attach_docker(svcs: &mut [Service], dports: &[DockerPort]) {
         if let Some(d) = by_port.get(&s.port) {
             s.container = d.name.clone();
             s.image = d.image.clone();
-            if s.source == "socket" {
-                s.source = "docker".into();
-            }
+            s.add_source("docker");
         }
     }
 }
@@ -226,7 +261,7 @@ pub fn attach_domains(svcs: &mut [Service], domains: &[(String, String)]) {
         }
         if let Some(dom) = by_container.get(s.container.as_str()) {
             s.domain = (*dom).to_string();
-            s.source = "traefik".into();
+            s.add_source("traefik");
         }
     }
 }
@@ -315,9 +350,9 @@ LISTEN 0 128  0.0.0.0:22    0.0.0.0:* users:((\"sshd\",pid=800,fd=3))";
         assert_eq!(panel.app_proto, "HTTP");
         assert_eq!(panel.process, "node");
         assert_eq!(panel.pid, 1234);
-        assert_eq!(panel.scope(), "PUBLIC");
+        assert_eq!(panel.scope(), "ALL"); // 0.0.0.0 binds every interface
         let pg = v.iter().find(|s| s.port == 5432).unwrap();
-        assert_eq!(pg.scope(), "LOCAL");
+        assert_eq!(pg.scope(), "LOOPBACK"); // 127.0.0.1
         assert_eq!(pg.app_proto, "PostgreSQL");
         let mirror = v.iter().find(|s| s.port == 8080).unwrap();
         assert_eq!(mirror.proto, "TCP6");
@@ -364,10 +399,76 @@ LISTEN 0 128  0.0.0.0:22    0.0.0.0:* users:((\"sshd\",pid=800,fd=3))";
         }];
         attach_docker(&mut svcs, &dports);
         assert_eq!(svcs[0].container, "panel");
-        assert_eq!(svcs[0].source, "docker");
+        assert_eq!(svcs[0].source, "socket+docker");
         attach_domains(&mut svcs, &[("panel.example.com".into(), "panel".into())]);
         assert_eq!(svcs[0].domain, "panel.example.com");
-        assert_eq!(svcs[0].source, "traefik");
+        assert_eq!(
+            svcs[0].source, "socket+docker+traefik",
+            "evidence accumulates, it does not overwrite"
+        );
+    }
+
+    #[test]
+    fn a_domainless_listener_still_produces_a_service_row() {
+        // The critical case: a plain process on :4000 with no DNS/Traefik at all.
+        let v = parse_ss("LISTEN 0 4096 0.0.0.0:4000 0.0.0.0:* users:((\"node\",pid=7,fd=3))");
+        assert_eq!(v.len(), 1);
+        let s = &v[0];
+        assert_eq!(s.port, 4000);
+        assert_eq!(s.bind, "0.0.0.0");
+        assert!(s.domain.is_empty(), "no domain required");
+        assert_eq!(s.status(), "LISTEN");
+        assert_eq!(s.scope(), "ALL");
+        assert_eq!(s.display_name(), "node");
+    }
+
+    #[test]
+    fn an_ipv6_domainless_listener_appears_too() {
+        let v = parse_ss("LISTEN 0 511 [::]:8080 [::]:*");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].port, 8080);
+        assert_eq!(v[0].proto, "TCP6");
+        assert!(v[0].domain.is_empty());
+        assert_eq!(v[0].status(), "LISTEN");
+        assert_eq!(v[0].scope(), "ALL");
+    }
+
+    #[test]
+    fn service_name_falls_back_to_listener_port_when_unresolved() {
+        // no process metadata (non-root ss, or /proc fallback) and no container
+        let s = Service {
+            bind: "0.0.0.0".into(),
+            port: 4000,
+            ..Default::default()
+        };
+        assert_eq!(s.display_name(), "listener:4000");
+    }
+
+    #[test]
+    fn scope_is_classified_from_the_real_bind() {
+        let mk = |b: &str| Service {
+            bind: b.into(),
+            port: 1,
+            ..Default::default()
+        };
+        assert_eq!(mk("0.0.0.0").scope(), "ALL");
+        assert_eq!(mk("::").scope(), "ALL");
+        assert_eq!(mk("127.0.0.1").scope(), "LOOPBACK");
+        assert_eq!(mk("::1").scope(), "LOOPBACK");
+        assert_eq!(mk("10.0.0.5").scope(), "PRIVATE");
+        assert_eq!(mk("192.168.1.4").scope(), "PRIVATE");
+        assert_eq!(mk("203.0.113.7").scope(), "PUBLIC");
+    }
+
+    #[test]
+    fn a_socket_with_no_process_metadata_still_parses() {
+        // ss without the users:(( )) column (unprivileged)
+        let v = parse_ss("LISTEN 0 128 0.0.0.0:22 0.0.0.0:*");
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].port, 22);
+        assert_eq!(v[0].process, "");
+        assert_eq!(v[0].pid, 0);
+        assert_eq!(v[0].display_name(), "listener:22");
     }
 
     #[test]

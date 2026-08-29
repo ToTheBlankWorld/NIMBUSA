@@ -28,6 +28,32 @@ fn health_color(s: HState) -> Color {
     }
 }
 
+/// Health of the *protected application only* — domains, containers, proxy —
+/// deliberately excluding NIMBUSA's own firewall readiness. Otherwise a box
+/// where enforcement is merely "ready" (ipset not yet armed) would report the
+/// application itself as UNAVAILABLE, which is a different and misleading thing.
+fn app_health(s: &ShieldSnapshot) -> HState {
+    use nimbusa::shield::health::Kind;
+    s.health
+        .checks
+        .iter()
+        .filter(|c| c.kind != Kind::Firewall && c.state != HState::Unknown)
+        .map(|c| c.state)
+        .max()
+        .unwrap_or(HState::Unknown)
+}
+
+/// A short, honest phrase for the application row: the health verdict when there
+/// is one, otherwise a clear "no monitored app" — never a fake healthy/zero.
+fn app_health_label(s: &ShieldSnapshot) -> &'static str {
+    match app_health(s) {
+        HState::Healthy => "HEALTHY",
+        HState::Degraded => "DEGRADED",
+        HState::Unavailable => "UNAVAILABLE",
+        HState::Unknown => "no monitored app",
+    }
+}
+
 fn on(b: bool) -> Span<'static> {
     if b {
         Span::styled(
@@ -178,6 +204,17 @@ fn render_dashboard(f: &mut Frame, area: Rect, s: &ShieldSnapshot) {
                 format!("   baseline {:.1}", m.rps_base),
                 Style::default().fg(Color::Gray),
             ),
+            // distinguish "no HTTP telemetry" from "application down"
+            Span::styled(
+                if !s.access_log_present {
+                    "   · access log not configured".to_string()
+                } else if m.rps < 0.5 {
+                    "   · no HTTP requests observed".to_string()
+                } else {
+                    String::new()
+                },
+                Style::default().fg(Color::DarkGray),
+            ),
         ]),
         Line::from(vec![
             Span::styled("BANDWIDTH IN  ", Style::default().fg(CREAM)),
@@ -245,8 +282,8 @@ fn render_dashboard(f: &mut Frame, area: Rect, s: &ShieldSnapshot) {
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!("   app {}", m.health_state),
-                Style::default().fg(health_color(s.health.overall())),
+                format!("   app {}", app_health_label(s)),
+                Style::default().fg(health_color(app_health(s))),
             ),
         ]),
     ];
@@ -583,9 +620,9 @@ fn render_incident(f: &mut Frame, area: Rect, s: &ShieldSnapshot) {
     right.push(Line::from(vec![
         Span::styled("  App ", Style::default().fg(CREAM)),
         Span::styled(
-            s.health.overall().as_str(),
+            app_health_label(s),
             Style::default()
-                .fg(health_color(s.health.overall()))
+                .fg(health_color(app_health(s)))
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
