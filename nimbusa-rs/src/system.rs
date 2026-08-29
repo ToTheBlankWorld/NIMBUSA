@@ -228,6 +228,48 @@ pub fn primary_iface() -> String {
     crate::shield::telemetry::primary_iface()
 }
 
+/// Unified service inventory: real listening sockets (ss / /proc), merged with
+/// docker published ports + images and Traefik `Host()` domains. Discovers
+/// services that have no DNS name at all (a panel on :4000, a mirror on :8080),
+/// which the docker-only `domains()` never saw. Degrades gracefully: with no
+/// docker it is pure listening-socket discovery; with neither ss nor /proc
+/// access it is simply empty (never a fake row).
+pub fn service_inventory() -> Vec<crate::shield::inventory::Service> {
+    use crate::shield::inventory::{self, DockerPort};
+    let mut dports: Vec<DockerPort> = Vec::new();
+    let mut domains: Vec<(String, String)> = Vec::new();
+    if have("docker") {
+        let out = run(
+            "docker",
+            &[
+                "ps",
+                "--no-trunc",
+                "--format",
+                "{{.Names}}\t{{.Image}}\t{{.Ports}}\t{{.Labels}}",
+            ],
+        );
+        for l in out.lines() {
+            let p: Vec<&str> = l.splitn(4, '\t').collect();
+            if p.len() < 3 {
+                continue;
+            }
+            let (name, image, ports) = (p[0], p[1], p[2]);
+            dports.extend(inventory::parse_docker_ports(name, image, ports));
+            let mut rest = p.get(3).copied().unwrap_or("");
+            while let Some(i) = rest.find("Host(`") {
+                let after = &rest[i + 6..];
+                if let Some(j) = after.find('`') {
+                    domains.push((after[..j].to_string(), name.to_string()));
+                    rest = &after[j + 1..];
+                } else {
+                    break;
+                }
+            }
+        }
+    }
+    inventory::build(&dports, &domains)
+}
+
 pub fn vnstat_full(flag: &str, iface: &str) -> Vec<(String, u64)> {
     if !have("vnstat") {
         return vec![];

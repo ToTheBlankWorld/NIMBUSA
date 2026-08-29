@@ -54,6 +54,8 @@ NIMBUSA SHIELD (ddos)\n\
 \n\
 AUDIT\n\
   audit verify              verify the tamper-evident incident chain\n\
+  audit diagnose            explain exactly why verification passes/fails\n\
+  audit migrate             seal an incompatible legacy chain, start a fresh one (auditable)\n\
   audit head                current chain head hash\n\
   audit log [N]             last N audit records\n\
 \n\
@@ -645,6 +647,29 @@ fn audit_cmd(args: &[String]) -> io::Result<()> {
             }
         }
         "head" => println!("{}", audit::verify().head),
+        "diagnose" => {
+            let v = audit::verify();
+            if v.ok {
+                println!("✓ chain verifies — {} records, head {}", v.records, v.head);
+            } else {
+                println!("✗ chain does NOT verify");
+                println!("  reason : {}", v.reason);
+                if let Some(seq) = v.broken_at {
+                    println!("  broken : seq {}", seq);
+                }
+                println!("  records verified before the break: {}", v.records);
+                println!(
+                    "\n  If this followed a NIMBUSA version/format change (not a real edit),\n  seal the old chain auditably with:  nimbusa audit migrate"
+                );
+            }
+        }
+        "migrate" => match audit::migrate() {
+            Ok(msg) => println!("✓ {}", msg),
+            Err(e) => {
+                println!("migration not performed: {}", e);
+                std::process::exit(2);
+            }
+        },
         "log" => {
             let n: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(20);
             let path = audit::LocalHashChainSink::default_path();
@@ -663,7 +688,7 @@ fn audit_cmd(args: &[String]) -> io::Result<()> {
                 Err(_) => println!("no audit chain yet"),
             }
         }
-        _ => println!("nimbusa audit: verify | head | log [N]"),
+        _ => println!("nimbusa audit: verify | diagnose | migrate | head | log [N]"),
     }
     Ok(())
 }

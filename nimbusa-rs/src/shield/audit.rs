@@ -370,6 +370,78 @@ pub fn verify() -> Verification {
     verify_path(&LocalHashChainSink::default_path())
 }
 
+/// Seal an incompatible chain and start a fresh one — **auditably**.
+///
+/// This is the honest answer to a chain that no longer verifies because an
+/// older build wrote records in a different canonical format (a version
+/// migration, not an attack). It NEVER rewrites or reinterprets a past record,
+/// and NEVER weakens verification. Instead it:
+///   1. refuses if the chain already verifies (nothing to migrate),
+///   2. archives the existing file verbatim next to the chain,
+///   3. records the archive's SHA-256, its record count and the exact verifier
+///      reason inside a new genesis `MIGRATION` record whose own hash covers
+///      that fingerprint — so the sealed past is itself tamper-evident.
+/// The new chain verifies from `GENESIS`; the legacy file stays on disk.
+pub fn migrate_path(path: &std::path::Path) -> Result<String, String> {
+    let body =
+        std::fs::read_to_string(path).map_err(|_| "no audit chain to migrate".to_string())?;
+    if body.trim().is_empty() {
+        return Err("audit chain is empty — nothing to migrate".into());
+    }
+    let v = verify_path(path);
+    if v.ok {
+        return Err(format!(
+            "audit chain already verifies ({} records) — migration refused",
+            v.records
+        ));
+    }
+    let stamp = epoch();
+    let legacy_hash = sha256_hex(&body);
+    let legacy_records = body.lines().filter(|l| !l.trim().is_empty()).count();
+    let archive = path.with_file_name(format!("chain.jsonl.legacy-{}", stamp));
+    std::fs::copy(path, &archive).map_err(|e| e.to_string())?;
+
+    // fresh chain: genesis MIGRATION record. prev_hash stays GENESIS so the new
+    // chain verifies normally; the legacy fingerprint lives in `detail`, which
+    // the record's own hash covers.
+    std::fs::write(path, "").map_err(|e| e.to_string())?;
+    let mut sink = LocalHashChainSink {
+        path: path.to_path_buf(),
+        head: GENESIS.to_string(),
+        seq: 0,
+    };
+    let mut r = Record {
+        seq: 0,
+        ts: stamp,
+        time: now_str(),
+        event_type: "MIGRATION".into(),
+        incident_id: "-".into(),
+        severity: "NORMAL".into(),
+        action: "chain-migrate".into(),
+        detail: format!(
+            "sealed legacy audit chain: {} records, sha256={}, reason=\"{}\", archived={}",
+            legacy_records,
+            legacy_hash,
+            v.reason,
+            archive.display()
+        ),
+        prev_hash: GENESIS.into(),
+        hash: String::new(),
+    };
+    r.hash = r.compute_hash();
+    sink.append(&r).map_err(|e| e.to_string())?;
+    Ok(format!(
+        "migrated: sealed {} legacy records (sha256 {}…), archived to {}; new chain genesis written",
+        legacy_records,
+        legacy_hash.chars().take(12).collect::<String>(),
+        archive.display()
+    ))
+}
+
+pub fn migrate() -> Result<String, String> {
+    migrate_path(&LocalHashChainSink::default_path())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -620,6 +692,57 @@ mod tests {
         assert!(s.anchor("abc").is_ok());
         assert_eq!(s.anchored, 0);
         assert_eq!(s.failures, 0);
+    }
+
+    #[test]
+    fn migration_seals_a_broken_chain_and_the_new_one_verifies() {
+        let p = tmp("migrate");
+        chain_of(&p, 6);
+        // a version/format-style break: edit a past record so the chain fails
+        let body = std::fs::read_to_string(&p).unwrap();
+        let mut lines: Vec<String> = body.lines().map(|s| s.to_string()).collect();
+        lines[2] = lines[2].replace("\"severity\":\"ATTACK\"", "\"severity\":\"NORMAL\"");
+        std::fs::write(&p, lines.join("\n") + "\n").unwrap();
+        assert!(!verify_path(&p).ok);
+
+        let msg = migrate_path(&p).unwrap();
+        assert!(msg.contains("sealed"), "{}", msg);
+
+        // the fresh chain verifies from genesis and holds exactly the migration record
+        let v = verify_path(&p);
+        assert!(v.ok, "{}", v.reason);
+        assert_eq!(v.records, 1);
+
+        // the migration record pins the sealed legacy fingerprint
+        let body2 = std::fs::read_to_string(&p).unwrap();
+        assert!(body2.contains("MIGRATION"));
+        assert!(body2.contains("sha256="));
+
+        // the legacy file is archived, not deleted
+        let dir = p.parent().unwrap();
+        assert!(std::fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e
+                .file_name()
+                .to_string_lossy()
+                .contains("chain.jsonl.legacy-")));
+
+        // migrating a chain that already verifies is refused
+        assert!(migrate_path(&p).is_err());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn migration_refuses_an_empty_or_verifying_chain() {
+        let p = tmp("migrate-clean");
+        assert!(migrate_path(&p).is_err(), "no chain yet");
+        chain_of(&p, 3);
+        assert!(
+            migrate_path(&p).is_err(),
+            "a verifying chain is not migrated"
+        );
+        let _ = std::fs::remove_dir_all(p.parent().unwrap());
     }
 
     #[test]

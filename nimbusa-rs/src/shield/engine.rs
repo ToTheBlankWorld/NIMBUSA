@@ -15,7 +15,7 @@ use super::incident::{self, Incident, Store};
 use super::mitigate::{Level, Mitigator, RuleKind};
 use super::recovery::{Action, Input, Machine, State as RState};
 use super::simulate::{Scenario, Simulation};
-use super::telemetry::{self, RawCounters};
+use super::telemetry::{self, IfaceRaw, IfaceStat, RawCounters};
 use super::window::{TickAgg, Window};
 use crate::config::Config;
 use crate::util::{epoch, human_bps};
@@ -46,6 +46,8 @@ pub struct ShieldSnapshot {
     pub audit_head: String,
     pub audit_records: u64,
     pub audit_verified: bool,
+    /// When not verified, the exact verifier reason (surfaced, never hidden).
+    pub audit_reason: String,
     pub audit_enabled: bool,
     pub anchor_configured: bool,
     pub anchor_state: String,
@@ -57,6 +59,13 @@ pub struct ShieldSnapshot {
     pub sample_series_bps: Vec<u64>,
     pub sample_series_conn: Vec<u64>,
     pub sample_series_score: Vec<u64>,
+    /// Live per-interface traffic (native /proc/net/dev, no vnstat needed).
+    pub ifaces: Vec<IfaceStat>,
+    /// Latest uplink live rates, for the Traffic totals row.
+    pub live_rx_bps: f64,
+    pub live_tx_bps: f64,
+    pub live_rx_pps: f64,
+    pub live_tx_pps: f64,
     pub uptime_ticks: u64,
     pub notes: Vec<String>,
 }
@@ -85,6 +94,7 @@ impl Default for ShieldSnapshot {
             audit_head: audit::GENESIS.into(),
             audit_records: 0,
             audit_verified: true,
+            audit_reason: String::new(),
             audit_enabled: true,
             anchor_configured: false,
             anchor_state: "local only".into(),
@@ -96,6 +106,11 @@ impl Default for ShieldSnapshot {
             sample_series_bps: vec![],
             sample_series_conn: vec![],
             sample_series_score: vec![],
+            ifaces: vec![],
+            live_rx_bps: 0.0,
+            live_tx_bps: 0.0,
+            live_rx_pps: 0.0,
+            live_tx_pps: 0.0,
             uptime_ticks: 0,
             notes: vec![],
         }
@@ -196,6 +211,14 @@ struct Engine {
     ser_bps: Vec<u64>,
     ser_conn: Vec<u64>,
     ser_score: Vec<u64>,
+
+    prev_ifaces: Vec<IfaceRaw>,
+    prev_ifaces_t: u64,
+    live_ifaces: Vec<IfaceStat>,
+    live_rx_bps: f64,
+    live_tx_bps: f64,
+    live_rx_pps: f64,
+    live_tx_pps: f64,
 }
 
 const SERIES_LEN: usize = 120;
@@ -232,6 +255,13 @@ impl Engine {
             ser_bps: vec![],
             ser_conn: vec![],
             ser_score: vec![],
+            prev_ifaces: telemetry::all_ifaces(),
+            prev_ifaces_t: epoch(),
+            live_ifaces: vec![],
+            live_rx_bps: 0.0,
+            live_tx_bps: 0.0,
+            live_rx_pps: 0.0,
+            live_tx_pps: 0.0,
             cfg,
             snap,
             ctx,
@@ -320,6 +350,20 @@ impl Engine {
         // ---- COLLECT ------------------------------------------------------
         let (raw, mut sample, census) = telemetry::tick(&self.prev_raw);
         self.prev_raw = raw;
+
+        // per-interface live rates from real /proc counters (never simulated,
+        // never vnstat) — captured here before any simulation overlay below.
+        let now_ifaces = telemetry::all_ifaces();
+        let now_t = epoch();
+        let idt = (now_t.saturating_sub(self.prev_ifaces_t)) as f64;
+        self.live_ifaces = telemetry::iface_rates(&self.prev_ifaces, &now_ifaces, idt);
+        self.prev_ifaces = now_ifaces;
+        self.prev_ifaces_t = now_t;
+        self.live_rx_bps = sample.rx_bps;
+        self.live_tx_bps = sample.tx_bps;
+        self.live_rx_pps = sample.rx_pps;
+        self.live_tx_pps = sample.tx_pps;
+
         let mut reqs = self.tailer.read_new();
 
         // ---- SIMULATION overlay (clearly flagged everywhere downstream) ---
@@ -631,6 +675,7 @@ impl Engine {
             audit_head: v.head.clone(),
             audit_records: v.records,
             audit_verified: v.ok,
+            audit_reason: v.reason.clone(),
             audit_enabled: self.cfg.audit_enabled,
             anchor_configured: self
                 .auditor
@@ -647,6 +692,11 @@ impl Engine {
             sample_series_bps: self.ser_bps.clone(),
             sample_series_conn: self.ser_conn.clone(),
             sample_series_score: self.ser_score.clone(),
+            ifaces: self.live_ifaces.clone(),
+            live_rx_bps: self.live_rx_bps,
+            live_tx_bps: self.live_tx_bps,
+            live_rx_pps: self.live_rx_pps,
+            live_tx_pps: self.live_tx_pps,
             uptime_ticks: self.tick_n,
             notes: self.snap.lock().unwrap().notes.clone(),
             assessment: a.clone(),

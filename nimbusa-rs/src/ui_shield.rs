@@ -442,6 +442,17 @@ fn render_mitigation_health(f: &mut Frame, area: Rect, s: &ShieldSnapshot) {
             Style::default().fg(audit_col).add_modifier(Modifier::BOLD),
         ),
     ]));
+    if !s.audit_verified && !s.audit_reason.is_empty() {
+        // never hide why — show the verifier's own reason, plus the safe fix
+        health.push(Line::from(Span::styled(
+            format!("  {}", trunc(&s.audit_reason, 44)),
+            Style::default().fg(Color::Red),
+        )));
+        health.push(Line::from(Span::styled(
+            "  → nimbusa audit diagnose / migrate",
+            Style::default().fg(Color::Gray),
+        )));
+    }
     f.render_widget(
         Paragraph::new(health).block(
             Block::default()
@@ -522,10 +533,38 @@ fn render_incident(f: &mut Frame, area: Rect, s: &ShieldSnapshot) {
         " WHY DETECTED",
         Style::default().fg(CREAM).add_modifier(Modifier::BOLD),
     ))];
-    for r in a.reasons.iter().take(9) {
+    // Explicit per-signal breakdown: which measurements moved the score and by
+    // how much. Straight from the detector — never invented.
+    let mut fired: Vec<&nimbusa::shield::detect::Signal> = a
+        .signals
+        .iter()
+        .filter(|s| s.fired && s.points > 0)
+        .collect();
+    fired.sort_by_key(|s| std::cmp::Reverse(s.points));
+    for sig in fired.iter().take(6) {
+        why.push(Line::from(vec![
+            Span::styled(
+                format!("  +{:<3} ", sig.points),
+                Style::default().fg(tcol).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{:<22}", trunc(&sig.label, 22)),
+                Style::default().fg(Color::White),
+            ),
+            Span::styled(trunc(&sig.evidence, 30), Style::default().fg(Color::Gray)),
+        ]));
+    }
+    why.push(Line::from(vec![
+        Span::styled("  = ", Style::default().fg(CREAM)),
+        Span::styled(
+            format!("{}/100 total", a.score),
+            Style::default().fg(tcol).add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    if let Some(d) = &a.damped {
         why.push(Line::from(Span::styled(
-            format!("  + {}", r),
-            Style::default().fg(Color::White),
+            format!("  (damped: {})", trunc(d, 40)),
+            Style::default().fg(Color::Gray),
         )));
     }
     f.render_widget(
@@ -585,6 +624,33 @@ fn render_incident(f: &mut Frame, area: Rect, s: &ShieldSnapshot) {
                 .add_modifier(Modifier::BOLD),
         ),
     ]));
+    // Incident timeline — real, timestamped events from the pipeline.
+    if !inc.timeline.is_empty() {
+        right.push(Line::from(Span::styled(
+            " TIMELINE",
+            Style::default().fg(CREAM).add_modifier(Modifier::BOLD),
+        )));
+        let n = inc.timeline.len();
+        let start = n.saturating_sub(5);
+        for ev in &inc.timeline[start..] {
+            let clock = ev
+                .time
+                .split_whitespace()
+                .nth(1)
+                .unwrap_or(ev.time.as_str());
+            right.push(Line::from(vec![
+                Span::styled(format!("  {} ", clock), Style::default().fg(Color::Gray)),
+                Span::styled(
+                    trunc(&ev.kind, 14),
+                    Style::default().fg(tcol).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(" {}", trunc(&ev.detail, 28)),
+                    Style::default().fg(Color::White),
+                ),
+            ]));
+        }
+    }
     f.render_widget(
         Paragraph::new(right).wrap(Wrap { trim: false }).block(
             Block::default()

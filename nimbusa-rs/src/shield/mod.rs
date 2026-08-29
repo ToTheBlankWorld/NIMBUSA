@@ -13,6 +13,7 @@ pub mod detect;
 pub mod engine;
 pub mod health;
 pub mod incident;
+pub mod inventory;
 pub mod mitigate;
 pub mod recovery;
 pub mod simulate;

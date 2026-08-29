@@ -134,6 +134,7 @@ struct Snapshot {
     t_daily: Vec<(String, u64)>,
     t_today: String,
     iface: String,
+    inventory: Vec<shield::inventory::Service>,
     ban_count: usize,
     bl_count: usize,
     wl_count: usize,
@@ -157,6 +158,7 @@ fn gather() -> Snapshot {
                 i,
             )
         });
+        let h_inv = sc.spawn(service_inventory);
         s.ov = h_ov.join().unwrap();
         let (svcs, doms) = h_dock.join().unwrap();
         s.svcs = svcs;
@@ -170,6 +172,7 @@ fn gather() -> Snapshot {
         s.t_daily = td;
         s.t_today = tt;
         s.iface = ifc;
+        s.inventory = h_inv.join().unwrap();
     });
     s.ssh.attackers = s.reg.values().filter(|e| e.attempts > 0).count();
     s.ban_count = s.reg.values().filter(|e| e.banned).count();
@@ -204,6 +207,7 @@ struct App {
     t_daily: Vec<(String, u64)>,
     t_today: String,
     iface: String,
+    inventory: Vec<shield::inventory::Service>,
     bl_count: usize,
     ban_count: usize,
     wl_count: usize,
@@ -239,6 +243,7 @@ impl App {
             t_daily: vec![],
             t_today: String::new(),
             iface: String::new(),
+            inventory: vec![],
             bl_count: 0,
             ban_count: 0,
             wl_count: 0,
@@ -286,6 +291,7 @@ impl App {
                 self.t_daily = s.t_daily;
                 self.t_today = s.t_today;
                 self.iface = s.iface;
+                self.inventory = s.inventory;
                 self.bl_count = s.bl_count;
                 self.ban_count = s.ban_count;
                 self.wl_count = s.wl_count;
@@ -349,7 +355,7 @@ fn run_app<B: Backend>(term: &mut Terminal<B>, app: &mut App) -> io::Result<()> 
         // Shield tab wants a live feel; the rest can idle
         let poll_ms = if !app.ready {
             80
-        } else if app.tab == T_SHIELD {
+        } else if app.tab == T_SHIELD || app.tab == T_TRAFFIC {
             250
         } else {
             300
@@ -1426,27 +1432,197 @@ fn svc_tab(f: &mut Frame, area: Rect, app: &mut App) {
 }
 
 fn dom_tab(f: &mut Frame, area: Rect, app: &mut App) {
+    // Unified "Domains & Services": every real listening socket, enriched with
+    // docker/traefik metadata where available. Not DNS-only any more.
+    if app.inventory.is_empty() {
+        let msg = if app.ready {
+            "No listening services discovered.\n\nNeeds `ss` (iproute2) or read access to /proc/net/tcp. \
+Docker/Traefik metadata is attached when those are present."
+        } else {
+            "discovering services…"
+        };
+        f.render_widget(
+            Paragraph::new(msg).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Domains & Services ")
+                    .border_style(Style::default().fg(CREAM)),
+            ),
+            area,
+        );
+        return;
+    }
     let rows: Vec<Row> = app
-        .doms
+        .inventory
         .iter()
-        .map(|(d, c)| Row::new(vec![Cell::from(d.clone()), Cell::from(c.clone())]))
+        .map(|s| {
+            let domain = if s.domain.is_empty() {
+                Span::styled("(no domain)", Style::default().fg(Color::DarkGray))
+            } else {
+                Span::styled(s.domain.clone(), Style::default().fg(Color::Cyan))
+            };
+            let service = if !s.container.is_empty() {
+                s.container.clone()
+            } else if !s.process.is_empty() {
+                s.process.clone()
+            } else {
+                "—".into()
+            };
+            let proto = if s.app_proto.is_empty() {
+                s.proto.clone()
+            } else {
+                s.app_proto.clone()
+            };
+            let scope = s.scope();
+            let scope_col = if scope == "PUBLIC" {
+                Color::Yellow
+            } else {
+                Color::DarkGray
+            };
+            let src = match s.source.as_str() {
+                "traefik" => Span::styled("TRAEFIK", Style::default().fg(Color::Magenta)),
+                "docker" => Span::styled("DOCKER", Style::default().fg(Color::Blue)),
+                _ => Span::styled("SOCKET", Style::default().fg(Color::Gray)),
+            };
+            Row::new(vec![
+                Cell::from(domain),
+                Cell::from(service),
+                Cell::from(s.bind.clone()),
+                Cell::from(format!("{}", s.port)),
+                Cell::from(proto),
+                Cell::from(Span::styled(scope, Style::default().fg(scope_col))),
+                Cell::from(src),
+            ])
+        })
         .collect();
     let (t, mut st) = table_widget(
-        vec!["DOMAIN", "BACKEND"],
+        vec![
+            "DOMAIN", "SERVICE", "ADDRESS", "PORT", "PROTO", "SCOPE", "SOURCE",
+        ],
         rows,
-        vec![Constraint::Length(36), Constraint::Min(10)],
+        vec![
+            Constraint::Min(18),
+            Constraint::Length(20),
+            Constraint::Length(16),
+            Constraint::Length(6),
+            Constraint::Length(7),
+            Constraint::Length(7),
+            Constraint::Length(8),
+        ],
         app.sel[T_DOMAINS],
-        format!(" Domains ({}) — Enter for cert/HTTP ", app.doms.len()),
+        format!(" Domains & Services ({}) ", app.inventory.len()),
     );
     f.render_stateful_widget(t, area, &mut st);
 }
 
 fn traffic_tab(f: &mut Frame, area: Rect, app: &mut App) {
+    // Live, native, vnstat-free: /proc/net/dev per-interface rates straight from
+    // the shield engine. Historical (vnstat) is optional and shown below.
+    let outer = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(7), Constraint::Length(12)])
+        .split(area);
+    live_traffic(f, outer[0], app);
+    historical_traffic(f, outer[1], app);
+}
+
+fn live_traffic(f: &mut Frame, area: Rect, app: &App) {
+    let snap = app.shield.as_ref().map(|s| s.read());
+    let ifaces = snap.as_ref().map(|s| s.ifaces.clone()).unwrap_or_default();
+    let (rx_tot, tx_tot, pps_tot) = snap
+        .as_ref()
+        .map(|s| (s.live_rx_bps, s.live_tx_bps, s.live_rx_pps + s.live_tx_pps))
+        .unwrap_or((0.0, 0.0, 0.0));
+    if ifaces.is_empty() {
+        f.render_widget(
+            Paragraph::new("live telemetry warming up… (needs one shield tick)").block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" LIVE TRAFFIC (native /proc/net/dev — no vnstat needed) ")
+                    .border_style(Style::default().fg(CREAM)),
+            ),
+            area,
+        );
+        return;
+    }
+    let trows: Vec<Row> = ifaces
+        .iter()
+        .map(|i| {
+            let (stat, scol) = if i.up {
+                ("ACTIVE", Color::Green)
+            } else {
+                ("DOWN", Color::DarkGray)
+            };
+            Row::new(vec![
+                Cell::from(i.name.clone()),
+                Cell::from(human(i.rx_bytes as f64)),
+                Cell::from(human(i.tx_bytes as f64)),
+                Cell::from(human_bps(i.rx_bps)),
+                Cell::from(human_bps(i.tx_bps)),
+                Cell::from(format!("{:.0}/s", i.rx_pps + i.tx_pps)),
+                Cell::from(Span::styled(stat, Style::default().fg(scol))),
+            ])
+        })
+        .collect();
+    let title = format!(
+        " LIVE TRAFFIC — total ↓{} ↑{} · {:.0} pkt/s (native, no vnstat) ",
+        human_bps(rx_tot),
+        human_bps(tx_tot),
+        pps_tot
+    );
+    let t = Table::new(
+        trows,
+        vec![
+            Constraint::Length(12),
+            Constraint::Length(11),
+            Constraint::Length(11),
+            Constraint::Length(12),
+            Constraint::Length(12),
+            Constraint::Length(9),
+            Constraint::Min(7),
+        ],
+    )
+    .header(
+        Row::new(vec![
+            "IFACE", "RX", "TX", "RX RATE", "TX RATE", "PKT/S", "STATUS",
+        ])
+        .style(Style::default().fg(CREAM).add_modifier(Modifier::BOLD)),
+    )
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(title)
+            .border_style(Style::default().fg(CREAM)),
+    );
+    f.render_widget(t, area);
+}
+
+fn historical_traffic(f: &mut Frame, area: Rect, app: &App) {
     let win = ["24h", "7d", "30d"][app.tw];
+    let vnstat_missing = app.t_today.contains("vnstat not installed") || app.t_hourly.is_empty();
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(2), Constraint::Min(6)])
         .split(area);
+    if vnstat_missing {
+        f.render_widget(
+            Paragraph::new(Line::from(vec![
+                Span::styled("HISTORICAL  ", Style::default().fg(CREAM)),
+                Span::styled(
+                    "vnstat unavailable — using NIMBUSA live telemetry above",
+                    Style::default().fg(Color::Yellow),
+                ),
+            ]))
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" HISTORICAL BANDWIDTH ")
+                    .border_style(Style::default().fg(CREAM)),
+            ),
+            area,
+        );
+        return;
+    }
     let picker: Vec<Span> = ["24h", "7d", "30d"]
         .iter()
         .enumerate()
@@ -1542,6 +1718,7 @@ fn sec_tab(f: &mut Frame, area: Rect, app: &mut App) {
         .constraints([
             Constraint::Length(1),
             Constraint::Length(1),
+            Constraint::Length(1),
             Constraint::Min(0),
         ])
         .split(area);
@@ -1583,6 +1760,55 @@ fn sec_tab(f: &mut Frame, area: Rect, app: &mut App) {
         ])),
         rows[1],
     );
+    // Live SHIELD firewall / rate-limit / DDoS-ipset state — the real enforcement
+    // mechanism, not the SSH registry. Every value comes from the engine.
+    let tag = |on: bool| -> Span<'static> {
+        if on {
+            Span::styled(" ACTIVE ", Style::default().fg(INK).bg(Color::Green))
+        } else {
+            Span::styled(" READY ", Style::default().fg(INK).bg(Color::DarkGray))
+        }
+    };
+    let sec_line = match app.shield.as_ref().map(|s| s.read()) {
+        Some(s) => Line::from(vec![
+            Span::styled(
+                "SHIELD ",
+                Style::default().fg(CREAM).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                if s.enforcing {
+                    "ENFORCING "
+                } else if s.capable {
+                    "READY "
+                } else {
+                    "OBSERVE "
+                },
+                Style::default().fg(if s.enforcing {
+                    Color::Green
+                } else {
+                    Color::Gray
+                }),
+            ),
+            Span::styled("· DDoS blocked ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                format!("{} ", s.blocked_sources),
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("· rate-limit", Style::default().fg(Color::Gray)),
+            tag(s.has_rate_limit),
+            Span::styled("· filtering", Style::default().fg(Color::Gray)),
+            tag(s.has_filtering),
+            Span::styled(
+                format!("· {} active rules", s.active_rules),
+                Style::default().fg(Color::Gray),
+            ),
+        ]),
+        None => Line::from(Span::styled(
+            "SHIELD engine not attached",
+            Style::default().fg(Color::DarkGray),
+        )),
+    };
+    f.render_widget(Paragraph::new(sec_line), rows[2]);
     let data = app.rows_security();
     let max = data.first().map(|(_, e)| e.attempts.max(1)).unwrap_or(1);
     let trows: Vec<Row> = data
@@ -1640,7 +1866,7 @@ fn sec_tab(f: &mut Frame, area: Rect, app: &mut App) {
     )
     .highlight_style(Style::default().fg(INK).bg(CREAM))
     .highlight_symbol("» ");
-    f.render_stateful_widget(t, rows[2], &mut ts);
+    f.render_stateful_widget(t, rows[3], &mut ts);
 }
 
 fn ssh_tab(f: &mut Frame, area: Rect, app: &mut App) {
@@ -1918,6 +2144,7 @@ fn render_debug(args: &[String]) {
     app.t_daily = s.t_daily;
     app.t_today = s.t_today;
     app.iface = s.iface;
+    app.inventory = s.inventory;
     app.bl_count = s.bl_count;
     app.ban_count = s.ban_count;
     app.wl_count = s.wl_count;

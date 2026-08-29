@@ -109,6 +109,109 @@ fn read_net_dev(iface: &str, c: &mut RawCounters) {
     }
 }
 
+/// Per-interface cumulative counters from /proc/net/dev — every real NIC, not
+/// just the uplink. Used by the live Traffic view, which must work with no
+/// vnstat installed because these counters are always present in the kernel.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct IfaceRaw {
+    pub name: String,
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+    pub rx_packets: u64,
+    pub tx_packets: u64,
+}
+
+/// Derived per-interface live rates.
+#[derive(Clone, Debug, Default)]
+pub struct IfaceStat {
+    pub name: String,
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+    pub rx_bps: f64,
+    pub tx_bps: f64,
+    pub rx_pps: f64,
+    pub tx_pps: f64,
+    pub up: bool,
+}
+
+/// Parse every interface row out of a /proc/net/dev body.
+pub fn parse_all_ifaces(body: &str) -> Vec<IfaceRaw> {
+    let mut v = Vec::new();
+    for line in body.lines().skip(2) {
+        let (name, rest) = match line.split_once(':') {
+            Some((a, b)) => (a.trim(), b),
+            None => continue,
+        };
+        let f: Vec<u64> = rest
+            .split_whitespace()
+            .map(|x| x.parse().unwrap_or(0))
+            .collect();
+        if f.len() < 10 {
+            continue;
+        }
+        v.push(IfaceRaw {
+            name: name.to_string(),
+            rx_bytes: f[0],
+            rx_packets: f[1],
+            tx_bytes: f[8],
+            tx_packets: f[9],
+        });
+    }
+    v
+}
+
+pub fn all_ifaces() -> Vec<IfaceRaw> {
+    parse_all_ifaces(&read("/proc/net/dev"))
+}
+
+/// Is the link carrying? `operstate == up`, or a driver that only reports
+/// `carrier`. Loopback (no carrier file, operstate "unknown") reads as up.
+pub fn iface_up(name: &str) -> bool {
+    let oper = read(&format!("/sys/class/net/{}/operstate", name));
+    let oper = oper.trim();
+    if oper == "up" {
+        return true;
+    }
+    if name == "lo" {
+        return true;
+    }
+    read(&format!("/sys/class/net/{}/carrier", name)).trim() == "1"
+}
+
+/// Derive per-interface rates from two consecutive raw readings `dt` apart.
+/// Loopback is dropped: it is not a NIC and only confuses the Traffic table.
+pub fn iface_rates(prev: &[IfaceRaw], now: &[IfaceRaw], dt: f64) -> Vec<IfaceStat> {
+    let pmap: std::collections::HashMap<&str, &IfaceRaw> =
+        prev.iter().map(|r| (r.name.as_str(), r)).collect();
+    let mut out = Vec::new();
+    for n in now {
+        if n.name == "lo" {
+            continue;
+        }
+        let (rb, rp, tb, tp) = match pmap.get(n.name.as_str()) {
+            Some(p) => (p.rx_bytes, p.rx_packets, p.tx_bytes, p.tx_packets),
+            None => (n.rx_bytes, n.rx_packets, n.tx_bytes, n.tx_packets),
+        };
+        out.push(IfaceStat {
+            name: n.name.clone(),
+            rx_bytes: n.rx_bytes,
+            tx_bytes: n.tx_bytes,
+            rx_bps: rate(n.rx_bytes, rb, dt) * 8.0,
+            tx_bps: rate(n.tx_bytes, tb, dt) * 8.0,
+            rx_pps: rate(n.rx_packets, rp, dt),
+            tx_pps: rate(n.tx_packets, tp, dt),
+            up: iface_up(&n.name),
+        });
+    }
+    out.sort_by(|a, b| {
+        (b.rx_bps + b.tx_bps)
+            .partial_cmp(&(a.rx_bps + a.tx_bps))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.name.cmp(&b.name))
+    });
+    out
+}
+
 /// /proc/net/snmp is two lines per protocol: a header of field names and a
 /// matching line of values, so fields are looked up by name rather than index
 /// (the set differs between kernels).
@@ -327,5 +430,70 @@ mod tests {
         assert!(is_docker_bridge("br-1a2b3c"));
         assert!(!is_docker_bridge("eth0"));
         assert!(!is_docker_bridge("vethabc"));
+    }
+
+    #[test]
+    fn parses_every_interface_row() {
+        let body = "\
+Inter-|   Receive                                                |  Transmit
+ face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
+    lo:  100      2    0    0    0     0          0         0      100      2    0    0    0     0       0          0
+  eth0: 5000     40    0    0    0     0          0         0     2000     30    0    0    0     0       0          0";
+        let v = parse_all_ifaces(body);
+        assert_eq!(v.len(), 2);
+        let eth = v.iter().find(|i| i.name == "eth0").unwrap();
+        assert_eq!(eth.rx_bytes, 5000);
+        assert_eq!(eth.tx_bytes, 2000);
+        assert_eq!(eth.rx_packets, 40);
+    }
+
+    #[test]
+    fn iface_rates_are_per_second_and_drop_loopback() {
+        let prev = vec![
+            IfaceRaw {
+                name: "eth0".into(),
+                rx_bytes: 1_000,
+                tx_bytes: 500,
+                rx_packets: 10,
+                tx_packets: 5,
+            },
+            IfaceRaw {
+                name: "lo".into(),
+                ..Default::default()
+            },
+        ];
+        let now = vec![
+            IfaceRaw {
+                name: "eth0".into(),
+                rx_bytes: 11_000,
+                tx_bytes: 2_500,
+                rx_packets: 110,
+                tx_packets: 25,
+            },
+            IfaceRaw {
+                name: "lo".into(),
+                rx_bytes: 9_999,
+                ..Default::default()
+            },
+        ];
+        let r = iface_rates(&prev, &now, 10.0);
+        assert_eq!(r.len(), 1, "loopback is excluded");
+        assert_eq!(r[0].name, "eth0");
+        assert_eq!(r[0].rx_bps, 1_000.0 * 8.0); // 10kB / 10s = 1kB/s
+        assert_eq!(r[0].tx_pps, 2.0);
+    }
+
+    #[test]
+    fn a_new_interface_reports_zero_not_a_spike() {
+        let now = vec![IfaceRaw {
+            name: "eth0".into(),
+            rx_bytes: 9_000_000,
+            tx_bytes: 1_000,
+            rx_packets: 100,
+            tx_packets: 10,
+        }];
+        let r = iface_rates(&[], &now, 5.0);
+        assert_eq!(r[0].rx_bps, 0.0);
+        assert_eq!(r[0].tx_bps, 0.0);
     }
 }
