@@ -106,6 +106,18 @@ fn main() -> io::Result<()> {
         return cli::run(&args);
     }
 
+    // Restore the terminal on ANY panic — the shield engine runs on its own
+    // thread, and without this its panic (and the poisoned-mutex panic it
+    // triggers in the render loop) would be swallowed by the alternate screen,
+    // leaving a corrupted terminal and no visible cause. The default hook still
+    // runs, so the real panic message + location is printed on a clean screen.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen, crossterm::cursor::Show);
+        default_hook(info);
+    }));
+
     enable_raw_mode()?;
     let mut out = io::stdout();
     execute!(out, EnterAlternateScreen)?;

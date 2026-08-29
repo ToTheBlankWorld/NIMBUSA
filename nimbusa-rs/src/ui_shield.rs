@@ -738,10 +738,37 @@ fn render_incident(f: &mut Frame, area: Rect, s: &ShieldSnapshot) {
     );
 }
 
+/// Truncate to at most `n` characters, appending an ellipsis when shortened.
+/// Operates on chars, never bytes: several rendered strings (signal evidence,
+/// incident detail, audit reasons) contain multibyte characters such as the em
+/// dash `—`, and byte-slicing them mid-codepoint panics `byte index N is not a
+/// char boundary` — which, on a background thread, silently tears down the TUI.
 fn trunc(s: &str, n: usize) -> String {
-    if s.len() <= n {
-        s.to_string()
-    } else {
-        format!("{}…", &s[..n.saturating_sub(1)])
+    if s.chars().count() <= n {
+        return s.to_string();
+    }
+    let mut out: String = s.chars().take(n.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::trunc;
+
+    #[test]
+    fn trunc_never_splits_a_multibyte_char() {
+        // exactly the shape that crashed: an em dash straddling the byte cut.
+        let s = "INTERNAL TRAFFIC ANOMALY — score 80/100, HIGH confidence";
+        for n in 0..=s.chars().count() + 4 {
+            let t = trunc(s, n); // must never panic
+            assert!(t.chars().count() <= n.max(1) + 1);
+        }
+    }
+
+    #[test]
+    fn trunc_leaves_short_strings_alone() {
+        assert_eq!(trunc("HTTP FLOOD", 28), "HTTP FLOOD");
+        assert_eq!(trunc("émigré — café", 40), "émigré — café");
     }
 }
