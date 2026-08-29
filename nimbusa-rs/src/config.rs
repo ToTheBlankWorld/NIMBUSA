@@ -536,10 +536,12 @@ mod tests {
 
     #[test]
     fn round_trips_through_toml() {
-        let mut c = Config::default();
-        c.window_seconds = 90;
-        c.mitigation_enabled = false;
-        c.access_log = "/var/log/t/a.log".into();
+        let c = Config {
+            window_seconds: 90,
+            mitigation_enabled: false,
+            access_log: "/var/log/t/a.log".into(),
+            ..Config::default()
+        };
         assert_eq!(Config::parse_toml(&c.to_toml()).config, c);
     }
 

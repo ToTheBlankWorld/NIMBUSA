@@ -986,8 +986,10 @@ mod tests {
 
     #[test]
     fn block_cap_is_respected() {
-        let mut cfg = Config::default();
-        cfg.max_auto_blocks = 3;
+        let cfg = Config {
+            max_auto_blocks: 3,
+            ..Config::default()
+        };
         let mut m = offline();
         let suspects: Vec<Suspect> = (0..50)
             .map(|i| suspect(&format!("45.0.0.{}", i + 1), 90))
@@ -1016,8 +1018,10 @@ mod tests {
 
     #[test]
     fn disabled_mitigation_applies_nothing() {
-        let mut cfg = Config::default();
-        cfg.mitigation_enabled = false;
+        let cfg = Config {
+            mitigation_enabled: false,
+            ..Config::default()
+        };
         let mut m = offline();
         let o = m.apply_level(Level::Emergency, "INC-6", &[suspect("9.9.9.9", 99)], &cfg);
         assert!(m.store.rules.is_empty());

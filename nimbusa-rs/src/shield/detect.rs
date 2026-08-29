@@ -22,6 +22,7 @@ use super::window::{Window, WindowView, OTHER};
 use crate::config::{Config, Threat};
 use crate::util::slash24;
 use serde::{Deserialize, Serialize};
+use std::cmp::Reverse;
 use std::collections::HashMap;
 
 /// Linear ramp: <= lo scores 0, >= hi scores 1.
@@ -844,7 +845,7 @@ pub fn network_suspects(suspects: &[Suspect], min_members: usize) -> Vec<(String
         .filter(|(_, (n, _))| *n >= min_members)
         .map(|(k, (n, r))| (k, n, r))
         .collect();
-    v.sort_by(|a, b| b.1.cmp(&a.1));
+    v.sort_by_key(|t| Reverse(t.1));
     v
 }
 

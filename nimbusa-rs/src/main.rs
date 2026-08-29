@@ -17,6 +17,7 @@ use nimbusa::util::*;
 use nimbusa::{cli, firewall, paths, shield};
 
 use crate::theme::*;
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::io::{self};
 use std::time::{Duration, Instant};
@@ -317,7 +318,7 @@ impl App {
                 .iter()
                 .map(|(k, r)| (k.clone(), r.clone()))
                 .collect();
-            v.sort_by(|a, b| b.1.attempts.cmp(&a.1.attempts));
+            v.sort_by_key(|(_, r)| Reverse(r.attempts));
             v
         } else {
             reg_filter(&self.reg, self.sub)
@@ -682,7 +683,7 @@ fn incident_report(i: &shield::incident::Incident) -> String {
         i.attack.as_str(), i.severity.as_str(), i.peak_score, i.started_time,
         dur_str(i.duration_secs), i.peak_rps, human_bps(i.peak_bps), i.source_count, i.network_count,
         i.target_domain, i.target_endpoint, i.blocked_sources, i.detection_secs, i.mitigation_secs,
-        i.recovery_secs, i.downtime_secs, i.availability_pct(), &i.audit_hash.chars().take(24).collect::<String>()
+        i.recovery_secs, i.downtime_secs, i.availability_pct(), i.audit_hash.chars().take(24).collect::<String>()
     );
     for r in &i.reasons {
         s.push_str(&format!("  + {}\n", r));

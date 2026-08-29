@@ -9,6 +9,7 @@ use crate::firewall;
 use crate::paths;
 use crate::util::*;
 use serde::{Deserialize, Serialize};
+use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader, Seek, SeekFrom};
@@ -461,9 +462,9 @@ pub fn reg_filter(reg: &HashMap<String, IpRec>, which: usize) -> Vec<(String, Ip
         _ => {}
     }
     if which == 5 {
-        v.sort_by(|a, b| b.1.logins.cmp(&a.1.logins));
+        v.sort_by_key(|(_, e)| Reverse(e.logins));
     } else {
-        v.sort_by(|a, b| b.1.attempts.cmp(&a.1.attempts));
+        v.sort_by_key(|(_, e)| Reverse(e.attempts));
     }
     v
 }

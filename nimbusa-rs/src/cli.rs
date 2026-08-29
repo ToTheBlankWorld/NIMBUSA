@@ -10,6 +10,7 @@ use crate::shield::{audit, Shield};
 use crate::system::*;
 use crate::util::*;
 use crate::{config, paths};
+use std::cmp::Reverse;
 use std::io;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -146,7 +147,7 @@ pub fn run(args: &[String]) -> io::Result<()> {
             let reg = reg_update();
             let rows = if which == last {
                 let mut v: Vec<_> = reg.iter().map(|(k, r)| (k.clone(), r.clone())).collect();
-                v.sort_by(|a, b| b.1.attempts.cmp(&a.1.attempts));
+                v.sort_by_key(|(_, e)| Reverse(e.attempts));
                 v
             } else {
                 reg_filter(&reg, which)
@@ -172,7 +173,7 @@ pub fn run(args: &[String]) -> io::Result<()> {
         "attackers" => {
             let reg = reg_update();
             let mut v: Vec<_> = reg.iter().filter(|(_, e)| e.attempts > 0).collect();
-            v.sort_by(|a, b| b.1.attempts.cmp(&a.1.attempts));
+            v.sort_by_key(|(_, e)| Reverse(e.attempts));
             for (ip, e) in v
                 .iter()
                 .take(args.get(1).and_then(|n| n.parse().ok()).unwrap_or(15))

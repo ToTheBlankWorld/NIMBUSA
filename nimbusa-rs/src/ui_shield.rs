@@ -619,7 +619,7 @@ fn render_incident(f: &mut Frame, area: Rect, s: &ShieldSnapshot) {
         Span::styled(
             format!(
                 " audit {} ",
-                &inc.audit_hash.chars().take(16).collect::<String>()
+                inc.audit_hash.chars().take(16).collect::<String>()
             ),
             Style::default().fg(INK).bg(CREAM),
         ),
