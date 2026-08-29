@@ -1,0 +1,31 @@
+[package]
+name = "nimbusa"
+version = "1.0.0"
+edition = "2021"
+description = "NIMBUSA — Autonomous Cloud DDoS Detection, Mitigation, Recovery & Security Control Center"
+
+[lib]
+name = "nimbusa"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nimbusa"
+path = "src/main.rs"
+required-features = ["tui"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# The terminal UI deps are only used by the `nimbusa` binary. Making them
+# optional lets the library's test suite build without a terminal backend
+# (and therefore without a mingw import-lib toolchain on some dev hosts).
+ratatui = { version = "0.26", optional = true }
+crossterm = { version = "0.27", optional = true }
+
+[features]
+default = ["tui"]
+tui = ["dep:ratatui", "dep:crossterm"]
+
+[profile.release]
+opt-level = 2
+codegen-units = 16

@@ -1,0 +1,28 @@
+[Unit]
+Description=NIMBUSA SHIELD — autonomous DDoS detection, mitigation, recovery & audit
+Documentation=https://github.com/ (NIMBUSA — SIH1649)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Headless engine: runs the full SHIELD pipeline (telemetry -> baseline ->
+# detect -> mitigate -> recover -> audit) with no TUI attached. It shares the
+# same /var/lib/nimbusa state the interactive tool reads, so `nimbusa ddos
+# status` reflects this process.
+ExecStart=/usr/local/bin/nimbusa ddos daemon
+Restart=on-failure
+RestartSec=5
+# NIMBUSA needs root to program ipset/iptables. It never disables the firewall
+# on failure; a crash simply stops new automatic rules (existing ones expire by
+# their kernel TTL).
+User=root
+Nice=-5
+# harden what we can without blocking the firewall syscalls the shield needs
+NoNewPrivileges=false
+ProtectHome=read-only
+ProtectSystem=full
+ReadWritePaths=/var/lib/nimbusa /var/log/nimbusa /run/nimbusa
+
+[Install]
+WantedBy=multi-user.target
