@@ -381,6 +381,7 @@ pub fn verify() -> Verification {
 ///   3. records the archive's SHA-256, its record count and the exact verifier
 ///      reason inside a new genesis `MIGRATION` record whose own hash covers
 ///      that fingerprint — so the sealed past is itself tamper-evident.
+///
 /// The new chain verifies from `GENESIS`; the legacy file stays on disk.
 pub fn migrate_path(path: &std::path::Path) -> Result<String, String> {
     let body =
